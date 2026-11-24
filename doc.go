@@ -107,6 +107,14 @@ following a connection loss. The application can get information about the state
 of the underlying connection by setting an event callback in the call to
 NewListener.
 
+Notification delivery never blocks the database connection: both Notify and
+the per-subscription channels created with [Listener.Subscribe] are bounded,
+and notifications that do not fit are dropped and counted (see
+[Listener.DroppedNotifications] and [Subscription.Dropped]) so that a consumer
+which falls behind cannot stall the delivery of notifications to other
+consumers. Applications that dispatch notifications per channel should prefer
+Subscribe over consuming Notify directly.
+
 A single [Listener] can safely be used from concurrent goroutines, which means
 that there is often no need to create more than one Listener in your
 application. However, a Listener is always connected to a single database, so

@@ -442,6 +442,94 @@ func (l ListenerEventType) String() string {
 	}[l]
 }
 
+// subscriber is a single per-channel subscription registered on a Listener.
+// The mutex guarantees that a notification is never sent on ch after it has
+// been closed: deliver and close are mutually exclusive.
+type subscriber struct {
+	mu       sync.Mutex
+	ch       chan *Notification
+	closed   bool
+	droppedN uint64
+}
+
+// deliver makes a best-effort, non-blocking attempt to queue n for the
+// subscriber. If the buffer is full the notification is dropped and counted,
+// so a slow consumer can never stall the connection read loop.
+func (s *subscriber) deliver(n *Notification) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	select {
+	case s.ch <- n:
+	default:
+		s.droppedN++
+	}
+}
+
+func (s *subscriber) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closed {
+		s.closed = true
+		close(s.ch)
+	}
+}
+
+func (s *subscriber) dropped() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.droppedN
+}
+
+// channelSubscribers holds the subscribers registered for one channel.
+type channelSubscribers struct {
+	// owned reports whether the server-side LISTEN was opened on behalf of
+	// the subscribers, as opposed to an explicit Listener.Listen call. Only
+	// owned channels are UNLISTENed when the last subscription goes away.
+	owned bool
+	subs  []*subscriber
+}
+
+// Subscription is a handle for a per-channel notification subscription
+// created with [Listener.Subscribe].
+type Subscription struct {
+	// Channel is the name of the PostgreSQL channel this subscription
+	// receives notifications for.
+	Channel string
+
+	// C receives the notifications sent on Channel. It is a bounded channel;
+	// when the subscriber falls behind and the buffer fills up, notifications
+	// are dropped and counted (see Dropped) instead of blocking the
+	// Listener. A nil value is sent after every reconnect to signal that
+	// notifications may have been lost. C is closed when the Subscription or
+	// the Listener is closed, and no notifications are delivered afterwards.
+	C <-chan *Notification
+
+	l    *Listener
+	sub  *subscriber
+	once sync.Once
+}
+
+// Dropped returns the number of notifications that were discarded for this
+// subscription because its buffer was full.
+func (s *Subscription) Dropped() uint64 {
+	return s.sub.dropped()
+}
+
+// Close removes the subscription and closes C. Notifications that were
+// already buffered can still be read from C. If this was the last
+// subscription for the channel and the underlying LISTEN was opened by
+// Subscribe, the Listener also stops listening on the channel. Close is
+// idempotent.
+func (s *Subscription) Close() error {
+	s.once.Do(func() {
+		s.l.removeSubscriber(s.Channel, s.sub)
+	})
+	return nil
+}
+
 // Listener provides an interface for listening to notifications from a
 // PostgreSQL database. For general usage information, see section
 // "Notifications".
@@ -450,6 +538,12 @@ func (l ListenerEventType) String() string {
 type Listener struct {
 	// Channel for receiving notifications from the database. In some cases a
 	// nil value will be sent. See section "Notifications" above.
+	//
+	// Notify has a bounded buffer and is fed without blocking: if the
+	// application does not keep up and the buffer fills up, notifications are
+	// dropped (and counted, see DroppedNotifications) rather than stalling
+	// the connection. Applications that need per-channel delivery with their
+	// own bounded buffer and drop counter should use Subscribe.
 	Notify chan *Notification
 
 	dsn                  string
@@ -464,6 +558,10 @@ type Listener struct {
 	cn                   *ListenerConn
 	connNotificationChan <-chan *Notification
 	channels             map[string]struct{}
+	subscribers          map[string]*channelSubscribers
+
+	// notifyDropped counts notifications that did not fit in Notify's buffer.
+	notifyDropped atomic.Uint64
 }
 
 // NewListener creates a new database connection dedicated to LISTEN / NOTIFY.
@@ -495,6 +593,7 @@ func NewDialListener(d Dialer, dsn string, minReconnect, maxReconnect time.Durat
 		dialer:               d,
 		eventCallback:        cb,
 		channels:             make(map[string]struct{}),
+		subscribers:          make(map[string]*channelSubscribers),
 		Notify:               make(chan *Notification, 32),
 	}
 	l.reconnectCond = sync.NewCond(&l.lock)
@@ -507,6 +606,134 @@ func NewDialListener(d Dialer, dsn string, minReconnect, maxReconnect time.Durat
 // of the Listener.
 func (l *Listener) NotificationChannel() <-chan *Notification {
 	return l.Notify
+}
+
+// Subscribe registers a subscription for the given channel and starts
+// listening on it (see Listen) if the Listener is not already doing so.
+// Notifications for the channel are delivered on the Subscription's C field,
+// independently of the Notify channel, so a slow consumer of Notify can never
+// hold up the subscription and vice versa.
+//
+// buffer is the size of the subscription's notification buffer; values
+// smaller than 1 are treated as 1. When the buffer is full, incoming
+// notifications for this subscription are dropped and counted (see
+// Subscription.Dropped) instead of blocking the Listener.
+//
+// The subscription survives connection loss: the Listener re-subscribes all
+// of its channels after reconnecting, and a nil notification is sent on C to
+// signal that notifications may have been lost in the meantime.
+//
+// The caller must eventually call Subscription.Close to release the
+// subscription.
+func (l *Listener) Subscribe(channel string, buffer int) (*Subscription, error) {
+	if buffer < 1 {
+		buffer = 1
+	}
+	sub := &subscriber{ch: make(chan *Notification, buffer)}
+
+	// Register the subscriber before issuing LISTEN so that no notification
+	// can arrive between the server acknowledgement and the registration.
+	l.lock.Lock()
+	if l.isClosed {
+		l.lock.Unlock()
+		return nil, net.ErrClosed
+	}
+	cs := l.subscribers[channel]
+	if cs == nil {
+		cs = &channelSubscribers{}
+		l.subscribers[channel] = cs
+	}
+	cs.subs = append(cs.subs, sub)
+	l.lock.Unlock()
+
+	err := l.Listen(channel)
+	switch err {
+	case nil:
+		// We opened the server-side LISTEN; remember that so the last
+		// subscription to go away can unlisten again.
+		l.lock.Lock()
+		cs.owned = true
+		l.lock.Unlock()
+	case ErrChannelAlreadyOpen:
+		// Already listening, either because of an explicit Listen call or
+		// another subscription; nothing more to do.
+	default:
+		l.removeSubscriber(channel, sub)
+		return nil, err
+	}
+
+	return &Subscription{Channel: channel, C: sub.ch, l: l, sub: sub}, nil
+}
+
+// removeSubscriber deregisters sub and closes its channel. If it was the
+// last subscriber of a channel whose LISTEN was opened by Subscribe, the
+// Listener stops listening on the channel.
+func (l *Listener) removeSubscriber(channel string, sub *subscriber) {
+	l.lock.Lock()
+	var cn *ListenerConn
+	if cs := l.subscribers[channel]; cs != nil {
+		for i, s := range cs.subs {
+			if s == sub {
+				cs.subs = append(cs.subs[:i], cs.subs[i+1:]...)
+				break
+			}
+		}
+		if len(cs.subs) == 0 {
+			delete(l.subscribers, channel)
+			if cs.owned {
+				// Drop the channel from the re-subscription set first so
+				// it is not re-established after a reconnect, even if the
+				// connection is currently down.
+				delete(l.channels, channel)
+				cn = l.cn
+			}
+		}
+	}
+	l.lock.Unlock()
+
+	sub.close()
+
+	if cn != nil {
+		// Best effort: tell the server to stop sending notifications for
+		// this channel. If the connection is already gone there is nothing
+		// to do; the channel set has been updated above either way.
+		_, _ = cn.Unlisten(channel)
+	}
+}
+
+// DroppedNotifications returns the number of notifications that were
+// discarded because the Notify channel's buffer was full.
+func (l *Listener) DroppedNotifications() uint64 {
+	return l.notifyDropped.Load()
+}
+
+// dispatch delivers a notification to the Notify channel and to all matching
+// subscribers. A nil notification (sent after a reconnect to signal possible
+// notification loss) is delivered to every subscriber. All sends are
+// non-blocking: notifications that do not fit in a buffer are dropped and
+// counted, so consumers that fall behind can never stall the goroutine
+// reading from the database connection.
+func (l *Listener) dispatch(n *Notification) {
+	l.lock.Lock()
+	var subs []*subscriber
+	if n == nil {
+		for _, cs := range l.subscribers {
+			subs = append(subs, cs.subs...)
+		}
+	} else if cs := l.subscribers[n.Channel]; cs != nil {
+		subs = append(subs, cs.subs...)
+	}
+	l.lock.Unlock()
+
+	for _, s := range subs {
+		s.deliver(n)
+	}
+
+	select {
+	case l.Notify <- n:
+	default:
+		l.notifyDropped.Add(1)
+	}
 }
 
 // Listen starts listening for notifications on a channel. Calls to this
@@ -763,6 +990,14 @@ func (l *Listener) Close() error {
 	}
 	l.isClosed = true
 
+	// Notify all subscribers that no more notifications will be delivered.
+	for _, cs := range l.subscribers {
+		for _, sub := range cs.subs {
+			sub.close()
+		}
+	}
+	l.subscribers = make(map[string]*channelSubscribers)
+
 	// Unblock calls to Listen()
 	l.reconnectCond.Broadcast()
 
@@ -804,7 +1039,9 @@ func (l *Listener) listenerConnLoop() {
 			l.emitEvent(ListenerEventConnected, nil)
 		} else {
 			l.emitEvent(ListenerEventReconnected, nil)
-			l.Notify <- nil
+			// A nil notification signals that notifications may have been
+			// lost while the connection was down.
+			l.dispatch(nil)
 		}
 
 		reconnectInterval = l.minReconnectInterval
@@ -815,7 +1052,7 @@ func (l *Listener) listenerConnLoop() {
 			if !ok { // lost connection, loop again
 				break
 			}
-			l.Notify <- notification
+			l.dispatch(notification)
 		}
 
 		err := l.disconnectCleanup()

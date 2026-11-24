@@ -380,6 +380,166 @@ func TestListenerReconnect(t *testing.T) {
 	wantNotification(t, l.Notify, n, "")
 }
 
+func TestListenerSubscribe(t *testing.T) {
+	t.Parallel()
+	l, _ := newTestListener(t)
+	defer l.Close()
+	db := pqtest.MustDB(t)
+	n := channelName()
+
+	sub, err := l.Subscribe(n, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	if sub.Channel != n {
+		t.Fatalf("wrong channel name: %q", sub.Channel)
+	}
+
+	pqtest.Exec(t, db, "notify "+n)
+	// The subscription receives the notification...
+	wantNotification(t, sub.C, n, "")
+	// ...and so does the legacy Notify channel.
+	wantNotification(t, l.Notify, n, "")
+	if d := sub.Dropped(); d != 0 {
+		t.Fatalf("unexpected drops: %d", d)
+	}
+}
+
+func TestListenerSubscribeSlowConsumer(t *testing.T) {
+	t.Parallel()
+	l, _ := newTestListener(t)
+	defer l.Close()
+	db := pqtest.MustDB(t)
+	n := channelName()
+
+	sub, err := l.Subscribe(n, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	// Flood the subscription without draining it.
+	for range 8 {
+		pqtest.Exec(t, db, "notify "+n)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for sub.Dropped() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if d := sub.Dropped(); d == 0 {
+		t.Fatal("expected dropped notifications to be counted")
+	}
+
+	// The backed-up subscriber must not stall the connection: the Listener
+	// still answers pings and keeps delivering.
+	if err := l.Ping(); err != nil {
+		t.Fatalf("listener stalled by slow subscriber: %v", err)
+	}
+	// Drain whatever is buffered, then verify delivery still works.
+	for {
+		select {
+		case <-sub.C:
+		default:
+			goto drained
+		}
+	}
+drained:
+	pqtest.Exec(t, db, "notify "+n)
+	wantNotification(t, sub.C, n, "")
+}
+
+func TestListenerSubscriptionClose(t *testing.T) {
+	t.Parallel()
+	l, _ := newTestListener(t)
+	defer l.Close()
+	db := pqtest.MustDB(t)
+	n := channelName()
+
+	sub, err := l.Subscribe(n, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pqtest.Exec(t, db, "notify "+n)
+	wantNotification(t, sub.C, n, "")
+	// The legacy Notify channel receives a copy as well; drain it so the
+	// check below is not confused by it.
+	wantNotification(t, l.Notify, n, "")
+
+	if err := sub.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// C must be closed and stay closed; Close is idempotent.
+	if _, ok := <-sub.C; ok {
+		t.Fatal("expected subscription channel to be closed")
+	}
+	if err := sub.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The subscription owned the LISTEN, so the Listener must have
+	// unlistened: no more deliveries on Notify either.
+	pqtest.Exec(t, db, "notify "+n)
+	wantNotification(t, l.Notify, "(empty)", "")
+	if err := l.Unlisten(n); err != ErrChannelNotOpen {
+		t.Fatalf("expected ErrChannelNotOpen; got %v", err)
+	}
+}
+
+func TestListenerSubscribeReconnect(t *testing.T) {
+	t.Parallel()
+	l, ch := newTestListenerTimeout(t, 20*time.Millisecond, time.Hour)
+	defer l.Close()
+	db := pqtest.MustDB(t)
+	n := channelName()
+
+	sub, err := l.Subscribe(n, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	pqtest.Exec(t, db, "notify "+n)
+	wantNotification(t, sub.C, n, "")
+
+	// Kill the connection and make sure it comes back up.
+	ok, err := l.cn.ExecSimpleQuery("select pg_terminate_backend(pg_backend_pid())")
+	if ok {
+		t.Fatalf("could not kill the connection: %v", err)
+	}
+	if !pqtest.ErrorContains(err, `or:EOF|pq: server conn crashed? (08P01)|pq: unable to forward message to frontend (XX000)`) {
+		t.Fatalf("unexpected error %T: %[1]s", err)
+	}
+
+	wantEvent(t, ch, ListenerEventDisconnected)
+	wantEvent(t, ch, ListenerEventReconnected)
+
+	// The subscription must be re-established on the new connection: a nil
+	// notification signals possible loss, then delivery resumes.
+	pqtest.Exec(t, db, "notify "+n)
+	wantNotification(t, sub.C, "(nil)", "")
+	wantNotification(t, sub.C, n, "")
+}
+
+func TestListenerCloseClosesSubscriptions(t *testing.T) {
+	t.Parallel()
+	l, _ := newTestListenerTimeout(t, 20*time.Millisecond, time.Hour)
+
+	sub, err := l.Subscribe(channelName(), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := <-sub.C; ok {
+		t.Fatal("expected subscription channel to be closed")
+	}
+	if _, err := l.Subscribe(channelName(), 1); err != net.ErrClosed {
+		t.Fatalf("expected net.ErrClosed; got %v", err)
+	}
+}
+
 func TestListenerClose(t *testing.T) {
 	t.Parallel()
 	l, _ := newTestListenerTimeout(t, 20*time.Millisecond, time.Hour)
