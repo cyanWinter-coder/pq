@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -23,8 +24,19 @@ func binaryEncode(x any) ([]byte, error) {
 	}
 }
 
+// binaryEncodeWithOID performs OID-aware binary encoding.  The OID is the
+// parameter type negotiated by Parse/Describe.
+func binaryEncodeWithOID(x any, pgtypOid oid.Oid) ([]byte, error) {
+	if pgtypOid == 0 || pgtypOid == oid.T_unknown {
+		return binaryEncode(x)
+	}
+	return binaryEncodeValue(x, pgtypOid)
+}
+
 func encode(x any, pgtypOid oid.Oid) ([]byte, error) {
 	switch v := x.(type) {
+	case nil:
+		return nil, nil
 	case int64:
 		return strconv.AppendInt(nil, v, 10), nil
 	case float64:
@@ -47,7 +59,7 @@ func encode(x any, pgtypOid oid.Oid) ([]byte, error) {
 	case time.Time:
 		return formatTS(v), nil
 	default:
-		return nil, fmt.Errorf("pq: encode: unknown type for %T", v)
+		return encodeFallback(x, pgtypOid)
 	}
 }
 
@@ -66,15 +78,44 @@ func binaryDecode(s []byte, typ oid.Oid) (any, error) {
 	switch typ {
 	case oid.T_bytea:
 		return s, nil
+	case oid.T_bool:
+		if len(s) != 1 {
+			return nil, fmt.Errorf("pq: unable to decode bool binary value; bad length: %d", len(s))
+		}
+		return s[0] != 0, nil
 	case oid.T_int8:
+		if len(s) != 8 {
+			return nil, fmt.Errorf("pq: unable to decode int8 binary value; bad length: %d", len(s))
+		}
 		return int64(binary.BigEndian.Uint64(s)), nil
 	case oid.T_int4:
+		if len(s) != 4 {
+			return nil, fmt.Errorf("pq: unable to decode int4 binary value; bad length: %d", len(s))
+		}
 		return int64(int32(binary.BigEndian.Uint32(s))), nil
 	case oid.T_int2:
+		if len(s) != 2 {
+			return nil, fmt.Errorf("pq: unable to decode int2 binary value; bad length: %d", len(s))
+		}
 		return int64(int16(binary.BigEndian.Uint16(s))), nil
+	case oid.T_float8:
+		if len(s) != 8 {
+			return nil, fmt.Errorf("pq: unable to decode float8 binary value; bad length: %d", len(s))
+		}
+		return math.Float64frombits(binary.BigEndian.Uint64(s)), nil
+	case oid.T_float4:
+		if len(s) != 4 {
+			return nil, fmt.Errorf("pq: unable to decode float4 binary value; bad length: %d", len(s))
+		}
+		return float64(math.Float32frombits(binary.BigEndian.Uint32(s))), nil
+	case oid.T_text, oid.T_varchar, oid.T_bpchar, oid.T_char, oid.T_name:
+		return string(s), nil
 	case oid.T_uuid:
 		return decodeUUIDBinary(s)
 	default:
+		if arrayElementOID(typ) != 0 {
+			return binaryDecodeArray(s)
+		}
 		return nil, fmt.Errorf("pq: don't know how to decode binary parameter of type %d", uint32(typ))
 	}
 

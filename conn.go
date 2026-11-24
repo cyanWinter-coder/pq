@@ -928,32 +928,9 @@ func (cn *conn) query(query string, args []driver.NamedValue) (*rows, error) {
 		return cn.simpleQuery(query)
 	}
 
-	if cn.cfg.BinaryParameters {
-		err := cn.sendBinaryModeQuery(query, args)
-		if err != nil {
-			return nil, cn.handleError(err, query)
-		}
-		err = cn.readParseResponse()
-		if err != nil {
-			return nil, cn.handleError(err, query)
-		}
-		err = cn.readBindResponse()
-		if err != nil {
-			return nil, cn.handleError(err, query)
-		}
-
-		rows := &rows{cn: cn}
-		rows.rowsHeader, err = cn.readPortalDescribeResponse()
-		if err != nil {
-			return nil, cn.handleError(err, query)
-		}
-		err = cn.postExecuteWorkaround()
-		if err != nil {
-			return nil, cn.handleError(err, query)
-		}
-		return rows, nil
-	}
-
+	// Always prepare/describe first.  The negotiated parameter OIDs are needed
+	// to encode arrays and custom types consistently across server versions;
+	// stmt.exec selects text or binary parameter formats from cn.cfg.
 	st, err := cn.prepareTo(query, "")
 	if err != nil {
 		return nil, cn.handleError(err, query)
@@ -981,34 +958,9 @@ func (cn *conn) ExecContext(ctx context.Context, query string, args []driver.Nam
 		return r, cn.handleError(err, query)
 	}
 
-	if cn.cfg.BinaryParameters {
-		err := cn.sendBinaryModeQuery(query, args)
-		if err != nil {
-			return nil, cn.handleError(err, query)
-		}
-		err = cn.readParseResponse()
-		if err != nil {
-			return nil, cn.handleError(err, query)
-		}
-		err = cn.readBindResponse()
-		if err != nil {
-			return nil, cn.handleError(err, query)
-		}
-
-		_, err = cn.readPortalDescribeResponse()
-		if err != nil {
-			return nil, cn.handleError(err, query)
-		}
-		err = cn.postExecuteWorkaround()
-		if err != nil {
-			return nil, cn.handleError(err, query)
-		}
-		res, _, err := cn.readExecuteResponse("Execute")
-		return res, cn.handleError(err, query)
-	}
-
 	// Use the unnamed statement to defer planning until bind time, or else
-	// value-based selectivity estimates cannot be used.
+	// value-based selectivity estimates cannot be used.  prepareTo also makes
+	// the negotiated parameter OIDs available to the encoder.
 	st, err := cn.prepareTo(query, "")
 	if err != nil {
 		return nil, cn.handleError(err, query)
@@ -1610,45 +1562,72 @@ func md5s(s string) string {
 }
 
 func (cn *conn) sendBinaryParameters(b *writeBuf, args []driver.NamedValue) error {
-	// Do one pass over the parameters to see if we're going to send any of them
-	// over in binary. If we are, create a paramFormats array at the same time.
-	var paramFormats []int
-	for i, x := range args {
-		_, ok := x.Value.([]byte)
-		if ok {
-			if paramFormats == nil {
-				paramFormats = make([]int, len(args))
-			}
-			paramFormats[i] = 1
-		}
+	return cn.sendBinaryParametersWithOIDs(b, args, nil)
+}
+
+// sendBinaryParametersWithOIDs writes Bind parameter formats and values.
+// paramTyps are the OIDs returned by Parse/Describe negotiation.  A nil entry
+// or unknown/custom array OID keeps the conservative text representation.
+func (cn *conn) sendBinaryParametersWithOIDs(b *writeBuf, args []driver.NamedValue, paramTyps []oid.Oid) error {
+	type encodedParam struct {
+		data   []byte
+		null   bool
+		binary bool
 	}
-	if paramFormats == nil {
-		b.int16(0)
+
+	// Encode everything before appending to the Bind buffer.  A failure here
+	// therefore prevents cn.send from being called and leaves cn.err untouched.
+	params := make([]encodedParam, len(args))
+	hasBinaryFormat := false
+	for i, x := range args {
+		typ := oid.Oid(0)
+		if i < len(paramTyps) {
+			typ = paramTyps[i]
+		}
+
+		data, f, err := encodeParameter(x.Value, typ, true)
+		if err != nil {
+			return err
+		}
+		p := encodedParam{data: data, binary: f == formatBinary}
+		if data == nil {
+			p.null = true
+		}
+
+		hasBinaryFormat = hasBinaryFormat || p.binary
+		params[i] = p
+	}
+
+	if !hasBinaryFormat {
+		b.int16(0) // Zero format codes means all parameters use text.
 	} else {
-		b.int16(len(paramFormats))
-		for _, x := range paramFormats {
-			b.int16(x)
+		b.int16(len(args))
+		for _, p := range params {
+			if p.binary {
+				b.int16(int(formatBinary))
+			} else {
+				b.int16(int(formatText))
+			}
 		}
 	}
 
 	b.int16(len(args))
-	for _, x := range args {
-		if x.Value == nil {
+	for _, p := range params {
+		if p.null {
 			b.int32(-1)
-		} else if xx, ok := x.Value.([]byte); ok && xx == nil {
-			b.int32(-1)
-		} else {
-			datum, err := binaryEncode(x.Value)
-			if err != nil {
-				return err
-			}
-			b.int32(len(datum))
-			b.bytes(datum)
+			continue
 		}
+		b.int32(len(p.data))
+		b.bytes(p.data)
 	}
 	return nil
 }
 
+func looksLikeTextArray(b []byte) bool {
+	return len(b) >= 2 && b[0] == '{' && b[len(b)-1] == '}'
+}
+
+//lint:ignore U1000 retained as the legacy one-shot binary-query protocol path
 func (cn *conn) sendBinaryModeQuery(query string, args []driver.NamedValue) error {
 	if len(args) >= 65536 {
 		return fmt.Errorf("pq: got %d parameters but PostgreSQL only supports 65535 parameters", len(args))

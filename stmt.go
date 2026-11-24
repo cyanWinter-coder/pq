@@ -110,12 +110,30 @@ func (st *stmt) exec(v []driver.NamedValue) error {
 	}
 
 	cn := st.cn
+
+	// Encode text parameters before allocating/writing their Bind payload.
+	// sendBinaryParameters does the equivalent atomic pre-encoding itself.
+	var textParams [][]byte
+	if !cn.cfg.BinaryParameters {
+		textParams = make([][]byte, len(v))
+		for i, x := range v {
+			if x.Value == nil {
+				continue
+			}
+			b, err := encode(x.Value, st.paramTyps[i])
+			if err != nil {
+				return err
+			}
+			textParams[i] = b
+		}
+	}
+
 	w := cn.writeBuf(proto.Bind)
 	w.byte(0) // unnamed portal
 	w.string(st.name)
 
 	if cn.cfg.BinaryParameters {
-		err := cn.sendBinaryParameters(w, v)
+		err := cn.sendBinaryParametersWithOIDs(w, v, st.paramTyps)
 		if err != nil {
 			return err
 		}
@@ -123,19 +141,11 @@ func (st *stmt) exec(v []driver.NamedValue) error {
 		w.int16(0)
 		w.int16(len(v))
 		for i, x := range v {
-			if x.Value == nil {
+			if x.Value == nil || textParams[i] == nil {
 				w.int32(-1)
 			} else {
-				b, err := encode(x.Value, st.paramTyps[i])
-				if err != nil {
-					return err
-				}
-				if b == nil {
-					w.int32(-1)
-				} else {
-					w.int32(len(b))
-					w.bytes(b)
-				}
+				w.int32(len(textParams[i]))
+				w.bytes(textParams[i])
 			}
 		}
 	}
