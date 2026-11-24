@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -62,11 +63,12 @@ func ForceBinaryParameters() bool {
 
 // InvalidCertificate reports if this error is an "invalid certificate" error.
 func InvalidCertificate(err error) bool {
-	switch err.(type) {
-	case x509.UnknownAuthorityError, x509.HostnameError, *tls.CertificateVerificationError:
-		return true
-	}
-	return false
+	var (
+		ua x509.UnknownAuthorityError
+		hn x509.HostnameError
+		cv *tls.CertificateVerificationError
+	)
+	return errors.As(err, &ua) || errors.As(err, &hn) || errors.As(err, &cv)
 }
 
 // Unsetenv unsets the environment variable and uses Cleanup to restore the

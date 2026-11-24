@@ -17,6 +17,23 @@ unreleased
 
 ### Fixes
 
+- Close the connection when sslmode=prefer or sslmode=allow retries with a
+  different SSL mode, instead of leaving a half-open connection on the
+  server.
+
+- Return the server's error when it responds to the SSLRequest message with
+  an ErrorResponse, instead of the generic "pq: SSL is not enabled on the
+  server", and return a clear error for any other unexpected response.
+
+- Select the SASL mechanism from the list the server offers instead of
+  assuming SCRAM-SHA-256, and return a clear error when the server doesn't
+  offer it (e.g. when it requires SCRAM-SHA-256-PLUS channel binding, which
+  pq does not support).
+
+- Add context to TLS handshake and server certificate verification errors
+  for sslmode=verify-ca (and sslmode=require/prefer with sslrootcert set);
+  the underlying x509 error is still available with errors.As/errors.Unwrap.
+
 - `sslnegotiation=direct` didn't work due to missing ALPN protocol [[#1332]).
 
 - Revert "clearer error when starting a new query while pq is still processing

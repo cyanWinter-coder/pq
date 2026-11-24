@@ -1683,6 +1683,43 @@ func TestAuth(t *testing.T) {
 	})
 }
 
+// The client should select a SASL mechanism from the list the server offers,
+// and report a clear error if it doesn't offer any we support.
+func TestAuthSASLMechanisms(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		mechs   string
+		wantErr string
+	}{
+		// Server requires channel binding, which we don't support.
+		{"SCRAM-SHA-256-PLUS\x00\x00", "pq: server requires SCRAM channel binding (SCRAM-SHA-256-PLUS)"},
+		// Server doesn't offer SCRAM-SHA-256 at all.
+		{"SCRAM-SHA-512\x00\x00", "pq: server does not support SCRAM-SHA-256 authentication (server offered: SCRAM-SHA-512)"},
+		// Server offers an empty list.
+		{"\x00", "pq: server does not support SCRAM-SHA-256 authentication (server offered: )"},
+	}
+	for _, tt := range tests {
+		t.Run("", func(t *testing.T) {
+			t.Parallel()
+
+			f := pqtest.NewFake(t, func(f pqtest.Fake, cn net.Conn) {
+				if _, _, ok := f.ReadStartup(cn); !ok {
+					return
+				}
+				// AuthenticationSASL (10) with the mechanism list.
+				f.WriteMsg(cn, proto.AuthenticationRequest,
+					string([]byte{0, 0, 0, byte(proto.AuthReqSASL)})+tt.mechs)
+			})
+
+			_, err := pqtest.DB(t, "sslmode=disable user=pqgo password=unused "+f.DSN())
+			if !pqtest.ErrorContains(err, tt.wantErr) {
+				t.Fatalf("wrong error:\nhave: %s\nwant: %s", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestUint64(t *testing.T) {
 	db := pqtest.MustDB(t)
 

@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -122,6 +123,107 @@ func TestSSLMode(t *testing.T) {
 				t.Fatalf("wrong error\nwant: %s\nhave: %s", tt.wantErr, err)
 			}
 		})
+	}
+}
+
+// The server may respond to the SSLRequest message with an ErrorResponse
+// rather than 'N' (e.g. some proxies); the client should return the server's
+// error rather than the generic ErrSSLNotSupported.
+func TestSSLRequestErrorResponse(t *testing.T) {
+	t.Parallel()
+
+	f := pqtest.NewFake(t, func(f pqtest.Fake, cn net.Conn) {
+		msg, ok := f.ReadStartupRaw(cn)
+		if !ok || len(msg) != 4 || binary.BigEndian.Uint32(msg) != proto.NegotiateSSLCode {
+			return
+		}
+		f.WriteMsg(cn, proto.ErrorResponse, "SFATAL\x00VFATAL\x00C28000\x00"+
+			"Mencryption not supported\x00Fauth.c\x00L462\x00RClientAuthentication\x00\x00")
+	})
+
+	_, err := pqtest.DB(t, "sslmode=require "+f.DSN())
+	if !pqtest.ErrorContains(err, "encryption not supported") {
+		t.Fatalf("wrong error: %q", err)
+	}
+}
+
+// The server responds to the SSLRequest message with something that's not
+// 'S', 'N', or an ErrorResponse.
+func TestSSLRequestInvalidResponse(t *testing.T) {
+	t.Parallel()
+
+	f := pqtest.NewFake(t, func(f pqtest.Fake, cn net.Conn) {
+		msg, ok := f.ReadStartupRaw(cn)
+		if !ok || len(msg) != 4 || binary.BigEndian.Uint32(msg) != proto.NegotiateSSLCode {
+			return
+		}
+		cn.Write([]byte{'X'})
+	})
+
+	_, err := pqtest.DB(t, "sslmode=require "+f.DSN())
+	if !pqtest.ErrorContains(err, `pq: unexpected response to SSL request: 'X'`) {
+		t.Fatalf("wrong error: %q", err)
+	}
+}
+
+// When sslmode=prefer (or allow) retries the connection with a different SSL
+// mode, the first connection must be closed rather than left half-open on
+// the server.
+func TestSSLRetryClosesConnection(t *testing.T) {
+	t.Parallel()
+
+	closed := make(chan error, 1)
+	f := pqtest.NewFake(t, func(f pqtest.Fake, cn net.Conn) {
+		msg, ok := f.ReadStartupRaw(cn)
+		if !ok {
+			return
+		}
+
+		// First connection: SSLRequest, which we refuse. The client should
+		// close this connection and open a new one without SSL.
+		if len(msg) == 4 && binary.BigEndian.Uint32(msg) == proto.NegotiateSSLCode {
+			cn.Write([]byte{'N'})
+			cn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			_, err := cn.Read(make([]byte, 1))
+			closed <- err
+			return
+		}
+
+		// Second connection: regular startup.
+		f.WriteMsg(cn, proto.AuthenticationRequest, "\x00\x00\x00\x00")
+		f.WriteMsg(cn, proto.ReadyForQuery, "I")
+		for {
+			code, _, ok := f.ReadMsg(cn)
+			if !ok {
+				return
+			}
+			switch code {
+			case proto.Query:
+				f.WriteMsg(cn, proto.EmptyQueryResponse, "")
+				f.WriteMsg(cn, proto.ReadyForQuery, "I")
+			case proto.Terminate:
+				cn.Close()
+				return
+			}
+		}
+	})
+
+	if _, err := pqtest.DB(t, "sslmode=prefer "+f.DSN()); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-closed:
+		if err == nil {
+			t.Fatal("connection still open after SSL was refused")
+		}
+		if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+			t.Fatal("client did not close the connection after SSL was refused")
+		}
+		// Any other error (io.EOF, connection reset) means the client
+		// closed the connection, as it should.
+	case <-time.After(15 * time.Second):
+		t.Fatal("timeout waiting for the server connection")
 	}
 }
 

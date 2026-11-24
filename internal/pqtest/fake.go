@@ -105,11 +105,15 @@ func (f Fake) Startup(cn net.Conn, params map[string]string) {
 
 // ReadStartup reads the startup message.
 func (f Fake) ReadStartup(cn net.Conn) (float32, map[string]string, bool) {
-	_, msg, ok := f.read(cn, true)
+	msg, ok := f.ReadStartupRaw(cn)
+	if !ok {
+		return 0, nil, false
+	}
 
+	// Like a real PostgreSQL server without SSL, respond to SSLRequest
+	// with a single 'N' byte.
 	if len(msg) == 4 && binary.BigEndian.Uint32(msg) == proto.NegotiateSSLCode {
-		f.WriteMsg(cn, proto.ErrorResponse, "SFATAL\x00VFATAL\x00C28000\x00"+
-			"encryption not supported\x00Fauth.c\x00L462\x00RClientAuthentication\x00\x00")
+		cn.Write([]byte{'N'})
 		return 3.0, nil, false
 	}
 
@@ -121,6 +125,14 @@ func (f Fake) ReadStartup(cn net.Conn) (float32, map[string]string, bool) {
 		params[m[i]] = m[i+1]
 	}
 	return float32(msg[1]) + float32(msg[3])/10, params, ok
+}
+
+// ReadStartupRaw reads a startup message (SSLRequest, CancelRequest, or a
+// regular startup message) and returns the raw payload, without responding
+// to SSLRequest like [Fake.ReadStartup] does.
+func (f Fake) ReadStartupRaw(cn net.Conn) ([]byte, bool) {
+	_, msg, ok := f.read(cn, true)
+	return msg, ok
 }
 
 // WriteStartup writes startup parameters.

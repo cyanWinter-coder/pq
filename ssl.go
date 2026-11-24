@@ -159,7 +159,7 @@ func ssl(cfg Config, mode SSLMode) (func(net.Conn) (net.Conn, error), error) {
 		if verifyCaOnly {
 			err := client.Handshake()
 			if err != nil {
-				return client, err
+				return client, fmt.Errorf("pq: TLS handshake with server failed: %w", err)
 			}
 			var (
 				certs = client.ConnectionState().PeerCertificates
@@ -169,7 +169,10 @@ func ssl(cfg Config, mode SSLMode) (func(net.Conn) (net.Conn, error), error) {
 				opts.Intermediates.AddCert(cert)
 			}
 			_, err = certs[0].Verify(opts)
-			return client, err
+			if err != nil {
+				return client, fmt.Errorf("pq: server certificate verification failed: %w", err)
+			}
+			return client, nil
 		}
 		return client, nil
 	}, nil

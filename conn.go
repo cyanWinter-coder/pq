@@ -289,6 +289,9 @@ restartAll:
 
 		err = cn.ssl(cn.cfg, mode)
 		if err != nil && mode == SSLModePrefer {
+			// Close the connection so we don't leave a half-open
+			// connection behind on the server.
+			_ = cn.c.Close()
 			mode = SSLModeDisable
 			goto restartHost
 		}
@@ -302,6 +305,9 @@ restartAll:
 		cn.buf = bufio.NewReader(cn.c)
 		err = cn.startup(cn.cfg)
 		if err != nil && mode == SSLModeAllow {
+			// Close the connection so we don't leave a half-open
+			// connection behind on the server.
+			_ = cn.c.Close()
 			mode = SSLModeRequire
 			goto restartHost
 		}
@@ -1305,13 +1311,49 @@ func (cn *conn) ssl(cfg Config, mode SSLMode) error {
 			return err
 		}
 
-		if b[0] != 'S' {
+		// The server responds with a single byte: 'S' if it's willing to
+		// do SSL, or 'N' if it doesn't support it. Some servers and
+		// proxies respond with an ErrorResponse rather than 'N'.
+		switch b[0] {
+		default:
+			return fmt.Errorf("pq: unexpected response to SSL request: %q", b[0])
+		case 'S': // SSL is supported; upgrade the connection below.
+		case 'N':
 			return ErrSSLNotSupported
+		case 'E':
+			return cn.sslRequestError()
 		}
 	}
 
 	cn.c, err = upgrade(cn.c)
 	return err
+}
+
+// sslRequestError reads the ErrorResponse the server sent in response to the
+// SSLRequest message, so the real reason SSL was refused is reported rather
+// than the generic [ErrSSLNotSupported].
+func (cn *conn) sslRequestError() error {
+	b := cn.scratch[:4]
+	if _, err := io.ReadFull(cn.c, b); err != nil {
+		return err
+	}
+	n := int(binary.BigEndian.Uint32(b)) - 4
+	if n < 1 || n > proto.MaxMsgLen {
+		return fmt.Errorf("pq: malformed error response from server: message length %d", n+4)
+	}
+
+	var y []byte
+	if n <= len(cn.scratch) {
+		y = cn.scratch[:n]
+	} else {
+		y = make([]byte, n)
+	}
+	if _, err := io.ReadFull(cn.c, y); err != nil {
+		return err
+	}
+
+	r := readBuf(y)
+	return parseError(&r, "")
 }
 
 func (cn *conn) startup(cfg Config) error {
@@ -1487,6 +1529,26 @@ func (cn *conn) auth(code proto.AuthCode, r *readBuf, cfg Config) error {
 		if len(cn.cfg.RequireAuth) > 0 && !slices.Contains(cn.cfg.RequireAuth, RequireAuthScramSHA256) && !slices.Contains(cn.cfg.RequireAuth, RequireAuthAny) {
 			return fmt.Errorf("pq: authentication method requirement %q failed: server requested %q", cn.cfg.RequireAuth, RequireAuthScramSHA256)
 		}
+
+		// The message contains the list of SASL mechanisms the server
+		// supports, in the server's order of preference, terminated by an
+		// empty string. Select a mechanism we support rather than assuming
+		// the server offers SCRAM-SHA-256.
+		var mechs []string
+		for len(*r) > 0 {
+			m := r.string()
+			if m == "" {
+				break
+			}
+			mechs = append(mechs, m)
+		}
+		if !slices.Contains(mechs, "SCRAM-SHA-256") {
+			if slices.Contains(mechs, "SCRAM-SHA-256-PLUS") {
+				return errors.New("pq: server requires SCRAM channel binding (SCRAM-SHA-256-PLUS), which pq does not support")
+			}
+			return fmt.Errorf("pq: server does not support SCRAM-SHA-256 authentication (server offered: %s)", strings.Join(mechs, ", "))
+		}
+
 		sc := scram.NewClient(sha256.New, cfg.User, cfg.Password)
 		if len(cn.cfg.ScramIterations) == 2 {
 			sc.AcceptIterations(cn.cfg.ScramIterations[0], cn.cfg.ScramIterations[1])
