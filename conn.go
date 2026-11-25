@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lib/pq/internal/pgpass"
@@ -190,6 +191,12 @@ type conn struct {
 	noticeHandler       func(*Error)        // If not nil, notices will be synchronously sent here
 	notificationHandler func(*Notification) // If not nil, notifications will be synchronously sent here
 	gss                 GSS                 // GSSAPI context
+
+	// copyIn is set while a COPY FROM STDIN is in progress on this
+	// connection. Commit and Rollback use it to terminate an abandoned COPY
+	// with CopyFail before talking to the server, so the connection returns
+	// to a reusable state instead of desynchronizing the protocol.
+	copyIn atomic.Pointer[copyin]
 }
 
 type syncErr struct {
@@ -543,6 +550,7 @@ func (cn *conn) Commit() error {
 	if err := cn.checkIsInTransaction(true); err != nil {
 		return err
 	}
+	cn.abortCopyIn()
 
 	// We don't want the client to think that everything is okay if it tries
 	// to commit a failed transaction.  However, no matter what we return,
@@ -586,6 +594,7 @@ func (cn *conn) Rollback() error {
 }
 
 func (cn *conn) rollback() (err error) {
+	cn.abortCopyIn()
 	if err := cn.checkIsInTransaction(true); err != nil {
 		return err
 	}
@@ -606,6 +615,17 @@ func (cn *conn) rollback() (err error) {
 func (cn *conn) gname() string {
 	cn.namei++
 	return strconv.FormatInt(int64(cn.namei), 10)
+}
+
+// abortCopyIn terminates a COPY FROM STDIN that is still in progress on
+// this connection, so that a following COMMIT or ROLLBACK does not
+// desynchronize the protocol. This happens when a COPY is abandoned —
+// e.g. when the caller's context was canceled and database/sql never
+// delivered another Exec to the driver.
+func (cn *conn) abortCopyIn() {
+	if ci := cn.copyIn.Load(); ci != nil {
+		ci.terminate(errCopyTxnEnd)
+	}
 }
 
 func (cn *conn) simpleExec(q string) (res driver.Result, commandTag string, resErr error) {

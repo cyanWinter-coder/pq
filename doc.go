@@ -88,6 +88,20 @@ related to the data passed in the call that failed.
 
 It is not possible to COPY outside of an explicit transaction in pq.
 
+Data is transmitted in batches: each flush is a single CopyData message whose
+length prefix is the batch boundary on the wire. The server confirms the
+stream cumulatively and reports a failing row immediately; when a COPY fails,
+the returned [*Error] carries the server-reported line number (see
+[Error.CopyLine]) and the number of rows and batches that had been
+transmitted (see [Error.CopyProgress]), so a restarted import can skip ahead
+in its input instead of re-sending everything. Note that PostgreSQL rolls
+back the whole COPY when any row fails; the batch ledger cannot change that.
+
+If a COPY is abandoned — e.g. the caller's context is canceled — the COPY is
+terminated with CopyFail and the remaining buffered rows are discarded, so
+the connection returns to a clean, reusable state instead of being discarded
+by the connection pool.
+
 Use nil for NULL, or explicitly add WITH NULL 'SOME STRING' (the default of \N
 doesn't work).
 

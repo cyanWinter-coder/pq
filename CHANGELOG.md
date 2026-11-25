@@ -9,6 +9,12 @@ unreleased
 
 ### Features
 
+- COPY FROM STDIN now tracks a batch ledger: each flush is one CopyData
+  message with an explicit boundary, and when the server rejects the stream
+  the returned `*pq.Error` reports the failing line number
+  (`Error.CopyLine`) and the rows/batches that had been transmitted
+  (`Error.CopyProgress`).
+
 - Implement `require_auth` connection parameter ([#1310]).
 
 - Implement setting minimum and maximum SCRAM iteration count with
@@ -16,6 +22,11 @@ unreleased
   default is 1000 and 10_000_000. ([#1444]).
 
 ### Fixes
+
+- An interrupted or canceled COPY FROM STDIN is now terminated with CopyFail
+  and drained to ReadyForQuery — including when the transaction is rolled
+  back or committed with a COPY still in progress — so the connection
+  returns to a reusable state instead of being discarded by the pool.
 
 - `sslnegotiation=direct` didn't work due to missing ALPN protocol [[#1332]).
 

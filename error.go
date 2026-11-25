@@ -106,6 +106,12 @@ type Error struct {
 	Routine string
 
 	query string
+
+	// Batch ledger of a failed COPY FROM STDIN, recorded by the driver when
+	// the server rejected the stream. See CopyProgress.
+	copyIn          bool
+	copyRowsSent    int64
+	copyBatchesSent int64
 }
 
 type (
@@ -173,6 +179,46 @@ func (e *Error) Fatal() bool { return e.Severity == pqerror.SeverityFatal }
 
 // SQLState returns the SQLState of the error.
 func (e *Error) SQLState() string { return string(e.Code) }
+
+// CopyLine returns the 1-based line number within the COPY data stream at
+// which the server reported the error, parsed from the error's context
+// ("COPY tbl, line 123, column c: ..."). ok is false if the server did not
+// report a COPY line number with this error.
+func (e *Error) CopyLine() (line int64, ok bool) {
+	if !strings.HasPrefix(e.Where, "COPY ") {
+		return 0, false
+	}
+	_, rest, _ := strings.Cut(e.Where, ", line ")
+	if rest == "" {
+		return 0, false
+	}
+	digits := 0
+	for digits < len(rest) && rest[digits] >= '0' && rest[digits] <= '9' {
+		digits++
+	}
+	if digits == 0 {
+		return 0, false
+	}
+	line, err := strconv.ParseInt(rest[:digits], 10, 64)
+	return line, err == nil
+}
+
+// CopyProgress reports the client-side batch ledger of a failed COPY FROM
+// STDIN at the moment the server rejected the stream: rowsSent and
+// batchesSent count the rows and batches (CopyData messages) that had been
+// transmitted to the server. Rows still in the client buffer are not
+// included. ok is false for errors that did not occur during COPY FROM
+// STDIN.
+//
+// Note that PostgreSQL rolls back the whole COPY when any row fails; the
+// ledger cannot change that. It tells the caller exactly which rows of the
+// source data had been handed to the server — combined with CopyLine this
+// identifies the rejected row and the rows discarded after it — so a
+// restarted import can skip ahead in its input instead of re-reading and
+// re-sending everything.
+func (e *Error) CopyProgress() (rowsSent, batchesSent int64, ok bool) {
+	return e.copyRowsSent, e.copyBatchesSent, e.copyIn
+}
 
 func (e *Error) Error() string {
 	msg := e.Message

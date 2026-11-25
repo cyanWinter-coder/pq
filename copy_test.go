@@ -1,7 +1,9 @@
 package pq
 
 import (
+	"context"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"net"
 	"reflect"
@@ -260,6 +262,158 @@ func TestCopyInRespLoopConnectionError(t *testing.T) {
 		} else {
 			t.Fatalf("unexpected error: %v", err)
 		}
+	}
+}
+
+func TestCopyLine(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		where string
+		line  int64
+		ok    bool
+	}{
+		{`COPY tbl, line 42, column c: "notanint"`, 42, true},
+		{`COPY tbl, line 7`, 7, true},
+		{`COPY "weird, name", line 3, column x`, 3, true},
+		{`SQL statement "insert into tbl values (1)"`, 0, false},
+		{`COPY tbl`, 0, false},
+		{"", 0, false},
+	}
+	for _, tt := range tests {
+		e := &Error{Where: tt.where}
+		line, ok := e.CopyLine()
+		if line != tt.line || ok != tt.ok {
+			t.Errorf("CopyLine(%q) = %d, %t; want %d, %t", tt.where, line, ok, tt.line, tt.ok)
+		}
+		if _, _, ok := e.CopyProgress(); ok {
+			t.Errorf("CopyProgress(%q) ok = true; want false for non-COPY error", tt.where)
+		}
+	}
+}
+
+// The server rejects a row mid-COPY: the returned *Error carries the
+// failing line number and the batch ledger, and the connection is back in a
+// reusable state afterwards.
+func TestCopyInErrorLineAndProgress(t *testing.T) {
+	t.Parallel()
+	db := pqtest.MustDB(t)
+	db.SetMaxOpenConns(1) // the checks below reuse the very same connection
+	tx := pqtest.Begin(t, db)
+	pqtest.Exec(t, tx, `create temp table tbl (num integer, txt text)`)
+
+	stmt := pqtest.Prepare(t, tx, `copy tbl (num, txt) from stdin`, db)
+	// Rows larger than the flush threshold are transmitted immediately, each
+	// as its own batch.
+	stmt.MustExec(t, int64(1), strings.Repeat("a", 70*1024))
+	stmt.MustExec(t, int64(2), strings.Repeat("b", 70*1024))
+	stmt.MustExec(t, "notanint", "x") // stays in the buffer until the sync
+
+	_, err := stmt.Exec()
+	pqErr := mustAs(t, err, pqerror.InvalidTextRepresentation)
+
+	if line, ok := pqErr.CopyLine(); !ok || line != 3 {
+		t.Errorf("CopyLine() = %d, %t; want 3, true (Where: %q)", line, ok, pqErr.Where)
+	}
+	rowsSent, batchesSent, ok := pqErr.CopyProgress()
+	if !ok {
+		t.Fatal("CopyProgress() ok = false; want true")
+	}
+	if rowsSent != 3 || batchesSent != 3 {
+		t.Errorf("CopyProgress() = %d rows, %d batches; want 3, 3", rowsSent, batchesSent)
+	}
+
+	// The connection must be in a clean state: roll back and reuse it.
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	pqtest.Query[int64](t, db, `select 1 as n`)
+}
+
+// Canceling the caller's context stops the COPY at the next batch boundary,
+// terminates it with CopyFail, and leaves the connection reusable.
+func TestCopyInCancel(t *testing.T) {
+	t.Parallel()
+	db := pqtest.MustDB(t)
+	db.SetMaxOpenConns(1) // the checks below reuse the very same connection
+	tx := pqtest.Begin(t, db)
+	pqtest.Exec(t, tx, `create temp table tbl (num integer)`)
+
+	stmt := pqtest.Prepare(t, tx, `copy tbl (num) from stdin`, db)
+	stmt.MustExec(t, int64(1))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := stmt.ExecContext(ctx, int64(2))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+
+	// The COPY is aborted, so the transaction is dead, but the connection
+	// must be back in a clean state: roll back and reuse it.
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	pqtest.Query[int64](t, db, `select 1 as n`)
+
+	// A new COPY on the same connection works.
+	tx = pqtest.Begin(t, db)
+	pqtest.Exec(t, tx, `create temp table tbl2 (num integer)`)
+	stmt = pqtest.Prepare(t, tx, `copy tbl2 (num) from stdin`, db)
+	stmt.MustExec(t, int64(1))
+	stmt.MustExec(t)
+	stmt.MustClose(t)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// CopyData with a canceled context terminates the COPY and leaves the
+// connection reusable.
+func TestCopyDataCancel(t *testing.T) {
+	t.Parallel()
+	db := pqtest.MustDB(t)
+
+	dc, err := db.Driver().Open(pqtest.DSN(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { dc.Close() })
+	cn := dc.(interface {
+		driver.ExecerContext
+		driver.ConnBeginTx
+		driver.ConnPrepareContext
+	})
+	ctx := context.Background()
+	if _, err := cn.ExecContext(ctx, `create temp table tbl (num integer)`, nil); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := cn.BeginTx(ctx, driver.TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := cn.PrepareContext(ctx, `copy tbl (num) from stdin`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ci := st.(interface {
+		CopyData(context.Context, string) (driver.Result, error)
+	})
+
+	if _, err := ci.CopyData(ctx, "1"); err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := ci.CopyData(canceled, "2"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	// The connection is reusable.
+	if _, err := cn.ExecContext(ctx, `select 1`, nil); err != nil {
+		t.Fatal(err)
 	}
 }
 
