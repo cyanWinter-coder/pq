@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lib/pq/internal/pgpass"
@@ -167,7 +168,7 @@ func (d defaultDialer) DialContext(ctx context.Context, network, address string)
 type conn struct {
 	c         net.Conn
 	buf       *bufio.Reader
-	namei     int
+	namei     atomic.Int64
 	scratch   [512]byte
 	txnStatus transactionStatus
 	txnFinish func()
@@ -184,6 +185,18 @@ type conn struct {
 	// functions should return the appropriate error by calling get()
 	// (ErrBadConn) or getForNext().
 	err syncErr
+
+	// lifecycleMu guards the fields below, which track server-side
+	// resources allocated on this connection so they can be cleaned up
+	// when the connection is closed.
+	lifecycleMu sync.Mutex
+	// stmts holds the prepared statements that have not been closed yet,
+	// by statement name.
+	stmts map[string]*stmt
+	// rset holds the result sets that have not been fully consumed yet.
+	rset map[*rows]struct{}
+	// closed is set once Close has been called.
+	closed bool
 
 	secretKey           []byte              // Cancellation key for CancelRequest messages.
 	pid                 int                 // Cancellation PID.
@@ -604,8 +617,62 @@ func (cn *conn) rollback() (err error) {
 }
 
 func (cn *conn) gname() string {
-	cn.namei++
-	return strconv.FormatInt(int64(cn.namei), 10)
+	// Allocate statement names atomically so that concurrent Prepare
+	// calls on the same connection can never receive the same name.
+	return strconv.FormatInt(cn.namei.Add(1), 10)
+}
+
+// trackStmt registers an open prepared statement so that it can be
+// cleaned up when the connection is closed. It returns an error if the
+// connection has already been closed.
+func (cn *conn) trackStmt(st *stmt) error {
+	cn.lifecycleMu.Lock()
+	defer cn.lifecycleMu.Unlock()
+	if cn.closed {
+		return driver.ErrBadConn
+	}
+	if cn.stmts == nil {
+		cn.stmts = make(map[string]*stmt)
+	}
+	cn.stmts[st.name] = st
+	return nil
+}
+
+// untrackStmt removes a statement from the connection's set of open
+// statements. It is safe to call multiple times for the same statement.
+func (cn *conn) untrackStmt(name string) {
+	cn.lifecycleMu.Lock()
+	delete(cn.stmts, name)
+	cn.lifecycleMu.Unlock()
+}
+
+// trackRows registers an unconsumed result set so that it can be cleaned
+// up when the connection is closed.
+func (cn *conn) trackRows(rs *rows) {
+	cn.lifecycleMu.Lock()
+	if !cn.closed {
+		if cn.rset == nil {
+			cn.rset = make(map[*rows]struct{})
+		}
+		cn.rset[rs] = struct{}{}
+	}
+	cn.lifecycleMu.Unlock()
+}
+
+// untrackRows removes a result set from the connection's set of open
+// result sets. It is safe to call multiple times for the same rows.
+func (cn *conn) untrackRows(rs *rows) {
+	cn.lifecycleMu.Lock()
+	delete(cn.rset, rs)
+	cn.lifecycleMu.Unlock()
+}
+
+// isClosed reports whether Close has been called on the connection.
+func (cn *conn) isClosed() bool {
+	cn.lifecycleMu.Lock()
+	closed := cn.closed
+	cn.lifecycleMu.Unlock()
+	return closed
 }
 
 func (cn *conn) simpleExec(q string) (res driver.Result, commandTag string, resErr error) {
@@ -695,6 +762,7 @@ func (cn *conn) simpleQuery(q string) (*rows, error) {
 					return nil, cn.handleError(err, q)
 				}
 				if res.colNames != nil {
+					cn.trackRows(res)
 					return res, cn.handleError(resErr, q)
 				}
 			}
@@ -713,6 +781,7 @@ func (cn *conn) simpleQuery(q string) (*rows, error) {
 				cn.err.set(driver.ErrBadConn)
 				return nil, fmt.Errorf("pq: unexpected DataRow in simple query execution")
 			}
+			cn.trackRows(res)
 			return res, cn.saveMessage(t, r) // The query didn't fail; kick off to Next
 		case proto.RowDescription:
 			// res might be non-nil here if we received a previous
@@ -820,6 +889,13 @@ func (cn *conn) prepareTo(q, stmtName string) (*stmt, error) {
 	if err != nil {
 		return nil, err
 	}
+	if st.name != "" {
+		// The unnamed statement is never tracked: it is replaced by the
+		// next Parse and is never explicitly closed.
+		if err := cn.trackStmt(st); err != nil {
+			return nil, err
+		}
+	}
 	return st, nil
 }
 
@@ -842,6 +918,23 @@ func (cn *conn) PrepareContext(ctx context.Context, q string) (driver.Stmt, erro
 }
 
 func (cn *conn) Close() error {
+	// On the first Close, clean up any statements and result sets that
+	// are still open, so that their Close/Next methods don't try to
+	// communicate with the server over a dead connection.
+	cn.lifecycleMu.Lock()
+	if !cn.closed {
+		cn.closed = true
+		for _, st := range cn.stmts {
+			st.closed.Store(true)
+		}
+		cn.stmts = nil
+		for rs := range cn.rset {
+			rs.done = true
+		}
+		cn.rset = nil
+	}
+	cn.lifecycleMu.Unlock()
+
 	// Don't go through send(); ListenerConn relies on us not scribbling on the
 	// scratch buffer of this connection.
 	err := cn.sendSimpleMessage(proto.Terminate)
@@ -942,7 +1035,7 @@ func (cn *conn) query(query string, args []driver.NamedValue) (*rows, error) {
 			return nil, cn.handleError(err, query)
 		}
 
-		rows := &rows{cn: cn}
+		rows := &rows{cn: cn, portal: true}
 		rows.rowsHeader, err = cn.readPortalDescribeResponse()
 		if err != nil {
 			return nil, cn.handleError(err, query)
@@ -951,6 +1044,7 @@ func (cn *conn) query(query string, args []driver.NamedValue) (*rows, error) {
 		if err != nil {
 			return nil, cn.handleError(err, query)
 		}
+		cn.trackRows(rows)
 		return rows, nil
 	}
 
@@ -962,10 +1056,13 @@ func (cn *conn) query(query string, args []driver.NamedValue) (*rows, error) {
 	if err != nil {
 		return nil, cn.handleError(err, query)
 	}
-	return &rows{
+	rs := &rows{
 		cn:         cn,
 		rowsHeader: st.rowsHeader,
-	}, nil
+		portal:     true,
+	}
+	cn.trackRows(rs)
+	return rs, nil
 }
 
 // Implement [driver.ExecerContext].

@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"os"
+	"sync/atomic"
 
 	"github.com/lib/pq/internal/proto"
 	"github.com/lib/pq/oid"
@@ -16,48 +17,61 @@ type stmt struct {
 	rowsHeader
 	colFmtData []byte
 	paramTyps  []oid.Oid
-	closed     bool
+	closed     atomic.Bool
 }
 
 func (st *stmt) Close() error {
-	if st.closed {
+	// Close is idempotent and safe for concurrent use: only the first
+	// call sends Close to the server, subsequent calls are no-ops.
+	if !st.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	if err := st.cn.err.get(); err != nil {
+	cn := st.cn
+	// The statement is no longer tracked by the connection, no matter
+	// what happens below.
+	if st.name != "" {
+		defer cn.untrackStmt(st.name)
+	}
+
+	// If the connection has already been closed, the server-side
+	// statement went away with it; there is nothing left to do.
+	if cn.isClosed() {
+		return nil
+	}
+	if err := cn.err.get(); err != nil {
 		return err
 	}
 
-	w := st.cn.writeBuf(proto.Close)
+	w := cn.writeBuf(proto.Close)
 	w.byte(proto.Sync)
 	w.string(st.name)
-	err := st.cn.send(w)
+	err := cn.send(w)
 	if err != nil {
-		return st.cn.handleError(err)
+		return cn.handleError(err)
 	}
-	err = st.cn.send(st.cn.writeBuf(proto.Sync))
+	err = cn.send(cn.writeBuf(proto.Sync))
 	if err != nil {
-		return st.cn.handleError(err)
+		return cn.handleError(err)
 	}
 
-	t, _, err := st.cn.recv1()
+	t, _, err := cn.recv1()
 	if err != nil {
-		return st.cn.handleError(err)
+		return cn.handleError(err)
 	}
 	if t != proto.CloseComplete {
-		st.cn.err.set(driver.ErrBadConn)
+		cn.err.set(driver.ErrBadConn)
 		return fmt.Errorf("pq: unexpected close response: %q", t)
 	}
-	st.closed = true
 
-	t, r, err := st.cn.recv1()
+	t, r, err := cn.recv1()
 	if err != nil {
-		return st.cn.handleError(err)
+		return cn.handleError(err)
 	}
 	if t != proto.ReadyForQuery {
-		st.cn.err.set(driver.ErrBadConn)
+		cn.err.set(driver.ErrBadConn)
 		return fmt.Errorf("pq: expected ready for query, but got: %q", t)
 	}
-	st.cn.processReadyForQuery(r)
+	cn.processReadyForQuery(r)
 
 	return nil
 }
@@ -75,11 +89,14 @@ func (st *stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (dri
 		return nil, st.cn.handleError(err)
 	}
 
-	return &rows{
+	rs := &rows{
 		cn:         st.cn,
 		rowsHeader: st.rowsHeader,
 		finish:     finish,
-	}, nil
+		portal:     true,
+	}
+	st.cn.trackRows(rs)
+	return rs, nil
 }
 
 // Implement [driver.StmtExecContext].

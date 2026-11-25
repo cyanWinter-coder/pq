@@ -36,6 +36,11 @@ type (
 		result driver.Result
 		tag    string
 
+		// portal is true when the rows were produced by an
+		// extended-protocol Execute, meaning the server may still hold a
+		// portal for the unread rows which should be closed explicitly.
+		portal bool
+
 		next *rowsHeader
 	}
 )
@@ -44,8 +49,39 @@ func (rs *rows) Close() error {
 	if rs.finish != nil {
 		defer rs.finish()
 	}
-	// no need to look at cn.bad as Next() will
-	for {
+	cn := rs.cn
+	if cn == nil {
+		return nil
+	}
+	// The result set is no longer tracked by the connection, no matter
+	// what happens below.
+	defer cn.untrackRows(rs)
+
+	if rs.done {
+		return nil
+	}
+
+	// If the connection is broken or has been closed there is no way —
+	// and no need — to tidy up: it will be discarded rather than reused.
+	if cn.err.get() != nil || cn.isClosed() {
+		rs.done = true
+		return nil
+	}
+
+	if rs.portal {
+		// The result set is abandoned before being fully consumed. Ask
+		// the server to close the portal so it can release the resources
+		// held by the unread rows, then discard messages until the
+		// connection is back in sync and can be reused.
+		return rs.closePortal()
+	}
+
+	// Simple-protocol result sets have no portal to close; discard the
+	// remaining messages so the connection can be reused. Keep draining
+	// even when an error occurs partway, otherwise the unread messages
+	// would desynchronize the connection and stall the next query.
+	var resErr error
+	for !rs.done {
 		err := rs.Next(nil)
 		switch err {
 		case nil:
@@ -54,13 +90,69 @@ func (rs *rows) Close() error {
 			// RowDescription (used with HasNextResultSet). We need to fetch
 			// messages until we hit a ReadyForQuery, which is done by waiting
 			// for done to be set.
-			if rs.done {
-				return nil
-			}
 		default:
-			return err
+			if resErr == nil {
+				resErr = err
+			}
+			if cn.err.get() != nil {
+				// The connection is broken; draining further could
+				// block forever. It will be discarded anyway.
+				rs.done = true
+			}
 		}
 	}
+	return resErr
+}
+
+// closePortal sends Close for the unnamed portal followed by Sync, and
+// then discards messages until the connection is synchronized again.
+// The connection is left usable for the next query.
+func (rs *rows) closePortal() error {
+	cn := rs.cn
+
+	w := cn.writeBuf(proto.Close)
+	w.byte(proto.RequestCode('P')) // close a portal
+	w.string("")                   // the unnamed portal
+	w.next(proto.Sync)
+	if err := cn.send(w); err != nil {
+		rs.done = true
+		return cn.handleError(err)
+	}
+
+	// Two ReadyForQuery messages are now outstanding: one for the Sync
+	// sent along with Execute, and one for the Sync sent above. Discard
+	// messages until both have been received.
+	var resErr error
+	for n := 0; n < 2; {
+		t, err := cn.recv1Buf(&rs.rb)
+		if err != nil {
+			rs.done = true
+			return cn.handleError(err)
+		}
+		switch t {
+		case proto.ReadyForQuery:
+			cn.processReadyForQuery(&rs.rb)
+			n++
+		case proto.ErrorResponse:
+			// This is either the deferred result of the Execute, or
+			// the Close failing because the portal no longer existed
+			// (e.g. its transaction had already ended). Either way the
+			// connection itself is still usable; report the first
+			// error to the caller.
+			if resErr == nil {
+				resErr = parseError(&rs.rb, "")
+			}
+		case proto.DataRow, proto.CommandComplete, proto.EmptyQueryResponse,
+			proto.CloseComplete, proto.RowDescription:
+			// Discard; the result set is being abandoned.
+		default:
+			cn.err.set(driver.ErrBadConn)
+			rs.done = true
+			return fmt.Errorf("pq: unexpected message while closing result set: %q", t)
+		}
+	}
+	rs.done = true
+	return cn.handleError(resErr)
 }
 
 func (rs *rows) Columns() []string {
